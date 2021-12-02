@@ -1,0 +1,116 @@
+package filterspan
+
+import (
+	"fmt"
+
+	"go.opentelemetry.io/collector/model/pdata"
+	conventions "go.opentelemetry.io/collector/model/semconv/v1.5.0"
+
+	"github.com/GANGAV08/filter_config/filterconfig"
+	"github.com/GANGAV08/filtermatcher/filtermatcher"
+	"github.com/GANGAV08/filterset/filterset"
+)
+
+type Matcher interface {
+	MatchSpan(span pdata.Span, resource pdata.Resource, library pdata.InstrumentationLibrary) bool
+}
+
+type propertiesMatcher struct {
+	filtermatcher.PropertiesMatcher
+
+	// Service names to compare to.
+	serviceFilters filterset.FilterSet
+
+	// Span names to compare to.
+	nameFilters filterset.FilterSet
+}
+
+// NewMatcher creates a span Matcher that matches based on the given MatchProperties.
+func NewMatcher(mp *filterconfig.MatchProperties) (Matcher, error) {
+	if mp == nil {
+		return nil, nil
+	}
+
+	if err := mp.ValidateForSpans(); err != nil {
+		return nil, err
+	}
+
+	rm, err := filtermatcher.NewMatcher(mp)
+	if err != nil {
+		return nil, err
+	}
+
+	var serviceFS filterset.FilterSet
+	if len(mp.Services) > 0 {
+		serviceFS, err = filterset.CreateFilterSet(mp.Services, &mp.Config)
+		if err != nil {
+			return nil, fmt.Errorf("error creating service name filters: %v", err)
+		}
+	}
+
+	var nameFS filterset.FilterSet
+	if len(mp.SpanNames) > 0 {
+		nameFS, err = filterset.CreateFilterSet(mp.SpanNames, &mp.Config)
+		if err != nil {
+			return nil, fmt.Errorf("error creating span name filters: %v", err)
+		}
+	}
+
+	return &propertiesMatcher{
+		PropertiesMatcher: rm,
+		serviceFilters:    serviceFS,
+		nameFilters:       nameFS,
+	}, nil
+}
+
+// SkipSpan determines if a span should be processed.
+// True is returned when a span should be skipped.
+// False is returned when a span should not be skipped.
+// The logic determining if a span should be processed is set
+// in the attribute configuration with the include and exclude settings.
+// Include properties are checked before exclude settings are checked.
+func SkipSpan(include Matcher, exclude Matcher, span pdata.Span, resource pdata.Resource, library pdata.InstrumentationLibrary) bool {
+	if include != nil {
+		// A false returned in this case means the span should not be processed.
+		if i := include.MatchSpan(span, resource, library); !i {
+			return true
+		}
+	}
+
+	if exclude != nil {
+		// A true returned in this case means the span should not be processed.
+		if e := exclude.MatchSpan(span, resource, library); e {
+			return true
+		}
+	}
+
+	return false
+}
+
+// MatchSpan matches a span and service to a set of properties.
+// see filterconfig.MatchProperties for more details
+func (mp *propertiesMatcher) MatchSpan(span pdata.Span, resource pdata.Resource, library pdata.InstrumentationLibrary) bool {
+	// If a set of properties was not in the mp, all spans are considered to match on that property
+	if mp.serviceFilters != nil {
+		serviceName := serviceNameForResource(resource)
+		if !mp.serviceFilters.Matches(serviceName) {
+			return false
+		}
+	}
+
+	if mp.nameFilters != nil && !mp.nameFilters.Matches(span.Name()) {
+		return false
+	}
+
+	return mp.PropertiesMatcher.Match(span.Attributes(), resource, library)
+}
+
+// serviceNameForResource gets the service name for a specified Resource.
+func serviceNameForResource(resource pdata.Resource) string {
+	service, found := resource.Attributes().Get(conventions.AttributeServiceName)
+	if !found {
+		return "<nil-service-name>"
+	}
+
+	return service.StringVal()
+}
